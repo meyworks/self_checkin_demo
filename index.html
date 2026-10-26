@@ -33,7 +33,7 @@
     <h2>امسح رمز QR لتسجيل حضورك</h2>
     <div id="reader"></div>
     <div class="buttons"><button type="button" id="startBtn" onclick="startScanner()">تشغيل الكاميرا</button><button type="button" class="secondary" id="stopBtn" onclick="stopScanner()" disabled>إيقاف الكاميرا</button></div>
-    <div class="hint">لاستخدام الكاميرا، افتح التطبيق عبر HTTPS واسمح بالوصول إليها.</div>
+    <div class="hint">لاستخدام الكاميرا، افتح التطبيق عبر HTTPS واسمح بالوصول إليها.</div><div id="scanDebug" class="hint" role="status" aria-live="polite">في انتظار قراءة QR...</div>
     <div class="demo"><strong>تجربة عملية بدون كاميرا</strong><div class="inputrow"><input id="mobile" inputmode="tel" placeholder="01xxxxxxxxx" aria-label="رقم الموبايل"><button onclick="checkinManually()">تسجيل الحضور</button></div>
       <div class="buttons"><button class="secondary" onclick="showQr()">إنشاء QR لرقم الموبايل</button></div><div class="hint">أضف رقم العضو إلى ورقة Members أولًا، ثم جرّب المسح أو الإدخال اليدوي.</div></div>
   </section>
@@ -47,7 +47,33 @@
 </div>
 <div class="qr-modal" id="qrModal" hidden><div class="qr-card"><h2>رمز QR للتجربة</h2><p>امسحه من شاشة أخرى أو اطبعه</p><div id="qrTarget"></div><small id="qrMobile"></small><button onclick="document.getElementById('qrModal').hidden=true">إغلاق</button></div></div>
 <script>
-let scanner=null, busy=false;
+let scanner=null, busy=false, lastScanValue='', lastScanAt=0;
+function setScanDebug(message){document.getElementById('scanDebug').textContent=message}
+function parseQrMobile(raw){
+  let value=String(raw||'').trim();
+  if(/^https?:\/\//i.test(value)){
+    try {const url=new URL(value);value=url.searchParams.get('mobile')||url.searchParams.get('phone')||'';} catch(e){return ''}
+  }
+  value=value.replace(/[\s()\-]/g,'').replace(/^\+/, '').replace(/\D/g,'');
+  if(/^20(1[0125]\d{8})$/.test(value))return '0'+value.slice(2);
+  if(/^1[0125]\d{8}$/.test(value))return '0'+value;
+  if(/^01[0125]\d{8}$/.test(value))return value;
+  return '';
+}
+function onQrDecoded(raw){
+  const now=Date.now(), value=String(raw||'').trim();
+  if(value===lastScanValue && now-lastScanAt<6000)return;
+  lastScanValue=value;lastScanAt=now;
+  const mobile=parseQrMobile(value);
+  if(!mobile){
+    setScanDebug('تمت قراءة QR، لكن محتواه ليس رقم موبايل صالحًا: '+value.slice(0,100));
+    setStatus('تم مسح QR لكن البيانات غير متوافقة. أنشئ QR من الزر الموجود بالصفحة.','warning');
+    return;
+  }
+  setScanDebug('تمت قراءة QR بنجاح: '+mobile);
+  document.getElementById('mobile').value=mobile;
+  requestCheckin(mobile);
+}
 function setStatus(message,kind){let e=document.getElementById('status');e.textContent=message;e.className='status '+(kind||'')}
 function setImage(url){let img=document.getElementById('photo'),avatar=document.getElementById('avatar');img.onerror=()=>{img.style.display='none';avatar.style.display='flex'};img.onload=()=>{img.style.display='block';avatar.style.display='none'};if(url){img.src=url}else{img.removeAttribute('src');img.style.display='none';avatar.style.display='flex'}}
 function requestCheckin(value){
@@ -82,11 +108,34 @@ function requestCheckin(value){
   url.searchParams.set('callback',callback);url.searchParams.set('nonce',Date.now().toString());
   tag.src=url.toString();document.head.appendChild(tag);
 }
-function submitMobile(value){requestCheckin(value)}
+function submitMobile(value){const mobile=parseQrMobile(value);if(!mobile){setStatus('أدخل رقم موبايل صحيحًا مكوّنًا من 11 رقمًا','warning');return}requestCheckin(mobile)}
 function checkinManually(){submitMobile(document.getElementById('mobile').value.trim())}
-async function startScanner(){if(scanner)return;if(typeof Html5Qrcode==='undefined'){setStatus('تعذر تحميل مكتبة المسح','error');return}let b=document.getElementById('startBtn');b.disabled=true;try{scanner=new Html5Qrcode('reader');await scanner.start({facingMode:'environment'},{fps:10,qrbox:{width:220,height:220}},text=>{if(!busy)submitMobile(text)},()=>{});document.getElementById('stopBtn').disabled=false}catch(e){scanner=null;b.disabled=false;setStatus('تعذر فتح الكاميرا: تحقق من الصلاحيات','error')}}
-async function stopScanner(){if(!scanner)return;try{await scanner.stop();scanner.clear()}catch(e){}scanner=null;document.getElementById('startBtn').disabled=false;document.getElementById('stopBtn').disabled=true}
-function showQr(){let value=document.getElementById('mobile').value.trim();if(!/^(?:\+?20)?0?1[0125]\d{8}$/.test(value.replace(/[\s\-]/g,''))){setStatus('أدخل رقم موبايل مصري صحيح أولاً','error');return}if(typeof QRCode==='undefined'){setStatus('تعذر تحميل مكتبة QR','error');return}document.getElementById('qrTarget').innerHTML='';new QRCode(document.getElementById('qrTarget'),{text:value,width:210,height:210});document.getElementById('qrMobile').textContent=value;document.getElementById('qrModal').hidden=false}
+async function startScanner(){
+  if(scanner)return;
+  if(typeof Html5Qrcode==='undefined'){setStatus('تعذر تحميل مكتبة QR؛ تحقق من الإنترنت','error');return}
+  const btn=document.getElementById('startBtn');btn.disabled=true;
+  try{
+    scanner=new Html5Qrcode('reader',{verbose:false,formatsToSupport:[Html5QrcodeSupportedFormats.QR_CODE]});
+    // Avoid a fixed small qrbox: scan the entire visible frame.
+    await scanner.start({facingMode:'environment'}, {fps:12,aspectRatio:1.333333}, onQrDecoded, ()=>{});
+    document.getElementById('stopBtn').disabled=false;
+    setScanDebug('الكاميرا تعمل — قرّب رمز QR واضحًا بالكامل أمام العدسة');
+    if(!busy)setStatus('وجّه الكاميرا نحو QR','processing');
+  }catch(e){
+    scanner=null;btn.disabled=false;
+    setScanDebug('فشل تشغيل الكاميرا: '+String(e&&e.message||e));
+    setStatus('تعذر فتح الكاميرا؛ راجع صلاحيات الموقع أو جرّب كاميرا أخرى','error');
+  }
+}
+async function stopScanner(){
+  if(!scanner)return;
+  try{await scanner.stop();scanner.clear()}catch(e){}
+  scanner=null;
+  document.getElementById('startBtn').disabled=false;
+  document.getElementById('stopBtn').disabled=true;
+  setScanDebug('الكاميرا متوقفة');
+}
+function showQr(){let value=parseQrMobile(document.getElementById('mobile').value);if(!value){setStatus('أدخل رقم موبايل مصري صحيح أولاً','error');return}if(typeof QRCode==='undefined'){setStatus('تعذر تحميل مكتبة QR','error');return}document.getElementById('qrTarget').innerHTML='';new QRCode(document.getElementById('qrTarget'),{text:value,width:210,height:210});document.getElementById('qrMobile').textContent=value;document.getElementById('qrModal').hidden=false}
 </script>
 </body>
 </html>
