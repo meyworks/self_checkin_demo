@@ -183,62 +183,99 @@ function updatePreviewOrientation(camera){
       currentCameraIndex!==preferredRearIndex(availableCameras));
   document.getElementById('reader').classList.toggle('front-camera',isFront);
 }
-async function startSelectedCamera(){
-  const camera=availableCameras[currentCameraIndex];
-  if(!camera)throw new Error('الكاميرا المختارة غير متاحة');
-  if(!scanner)scanner=new Html5Qrcode('reader',{verbose:false,formatsToSupport:[Html5QrcodeSupportedFormats.QR_CODE]});
-  await scanner.start(camera.id,{
-    fps:22,
-    qrbox:(viewW,viewH)=>{const size=Math.max(90,Math.floor(Math.min(viewW,viewH)*.83));return {width:size,height:size};},
-    disableFlip:false,
-    videoConstraints:{deviceId:{exact:camera.id},width:{ideal:1280},height:{ideal:720}}
-  },onQrDecoded,()=>{});
-  cameraRunning=true;
-  updatePreviewOrientation(camera);
-  document.getElementById('startBtn').disabled=true;
-  document.getElementById('stopBtn').disabled=false;
-  document.getElementById('switchBtn').disabled=availableCameras.length<2;
-  setScanDebug('الكاميرا تعمل — قرّب رمز QR واضحًا بالكامل أمام العدسة');
-  if(!busy)setStatus('وجّه الكاميرا نحو QR','processing');
+// Camera starts with environment-facing mode first (more reliable on Android).
+// Avoid combining a camera ID and exact videoConstraints: Android browsers may reject it.
+function newQrScanner(){
+  return new Html5Qrcode('reader',{verbose:false,formatsToSupport:[Html5QrcodeSupportedFormats.QR_CODE]});
 }
+function scanConfig(){
+  return {fps:12, qrbox:(w,h)=>{
+    const side=Math.max(80,Math.floor(Math.min(w,h)*.86));
+    return {width:side,height:side};
+  },disableFlip:false};
+}
+async function releaseScanner(){
+  if(!scanner)return;
+  try{if(cameraRunning || scanner.getState()===2)await scanner.stop()}catch(_){}
+  try{scanner.clear()}catch(_){}
+  scanner=null;cameraRunning=false;
+}
+async function tryCamera(source, label){
+  await releaseScanner();
+  scanner=newQrScanner();
+  setScanDebug('جارٍ تجربة '+label+'...');
+  try{
+    await scanner.start(source,scanConfig(),onQrDecoded,()=>{});
+    cameraRunning=true;
+    document.getElementById('reader').classList.toggle('front-camera',typeof source==='object'&&source.facingMode==='user');
+    document.getElementById('startBtn').disabled=true;
+    document.getElementById('stopBtn').disabled=false;
+    document.getElementById('switchBtn').disabled=availableCameras.length<2;
+    setScanDebug('الكاميرا تعمل — وجّه QR نحو العدسة');
+    if(!busy)setStatus('وجّه الكاميرا نحو QR','processing');
+    return true;
+  }catch(e){
+    cameraErrors.push(label+': '+String(e&&e.message||e));
+    await releaseScanner();
+    return false;
+  }
+}
+let cameraErrors=[];
 async function startScanner(){
   unlockAudio();
   if(cameraRunning||cameraSwitching)return;
+  if(!window.isSecureContext){setStatus('الكاميرا تحتاج رابط HTTPS آمنًا','error');return}
   if(typeof Html5Qrcode==='undefined'){setStatus('تعذر تحميل مكتبة QR؛ تحقق من الإنترنت','error');return}
+  cameraSwitching=true;
   document.getElementById('startBtn').disabled=true;
+  cameraErrors=[];
   try{
-    availableCameras=await Html5Qrcode.getCameras();
-    if(!availableCameras.length)throw new Error('لم يتم العثور على كاميرا');
-    currentCameraIndex=preferredRearIndex(availableCameras);
-    await startSelectedCamera();
-  }catch(e){
-    if(scanner&&!cameraRunning){try{scanner.clear()}catch(_){} scanner=null}
-    document.getElementById('startBtn').disabled=false;
-    document.getElementById('switchBtn').disabled=true;
-    setScanDebug('فشل تشغيل الكاميرا: '+String(e&&e.message||e));
-    setStatus('تعذر فتح الكاميرا؛ راجع صلاحيات الموقع أو جرّب كاميرا أخرى','error');
+    // Try generic facingMode first; avoids Android deviceId exact failures.
+    if(await tryCamera({facingMode:'environment'},'الكاميرا الخلفية'))return;
+    try{availableCameras=await Html5Qrcode.getCameras()}catch(e){cameraErrors.push('قائمة الكاميرات: '+String(e&&e.message||e));availableCameras=[]}
+    const order=availableCameras.map((_,i)=>i);
+    const rear=preferredRearIndex(availableCameras);
+    if(order.includes(rear)){order.splice(order.indexOf(rear),1);order.unshift(rear)}
+    for(const i of order){
+      currentCameraIndex=i;
+      if(await tryCamera(availableCameras[i].id,'الكاميرا '+(i+1))){updatePreviewOrientation(availableCameras[i]);return}
+    }
+    if(await tryCamera({facingMode:'user'},'الكاميرا الأمامية'))return;
+    setStatus('تعذر فتح الكاميرا. تفاصيل الخطأ أسفلها.','error');
+    setScanDebug('سبب الفشل: '+cameraErrors.join(' | '));
+  }finally{
+    cameraSwitching=false;
+    document.getElementById('startBtn').disabled=cameraRunning;
+    document.getElementById('stopBtn').disabled=!cameraRunning;
   }
 }
 async function switchCamera(){
-  if(!cameraRunning||cameraSwitching||availableCameras.length<2)return;
+  if(!cameraRunning||cameraSwitching)return;
   cameraSwitching=true;
-  const btn=document.getElementById('switchBtn');btn.disabled=true;
+  cameraErrors=[];
   try{
-    await scanner.stop();cameraRunning=false;
-    currentCameraIndex=(currentCameraIndex+1)%availableCameras.length;
-    await startSelectedCamera();
-  }catch(e){
-    setScanDebug('تعذر تبديل الكاميرا: '+String(e&&e.message||e));
-    setStatus('تعذر تبديل الكاميرا؛ اضغط تشغيل الكاميرا مجددًا','error');
-    cameraRunning=false;
-    document.getElementById('startBtn').disabled=false;
-    document.getElementById('stopBtn').disabled=true;
-  }finally{cameraSwitching=false;btn.disabled=!cameraRunning||availableCameras.length<2}
+    if(!availableCameras.length){
+      try{availableCameras=await Html5Qrcode.getCameras()}catch(_){}
+    }
+    if(availableCameras.length>1){
+      let next=(currentCameraIndex+1)%availableCameras.length;
+      if(await tryCamera(availableCameras[next].id,'الكاميرا '+(next+1))){currentCameraIndex=next;updatePreviewOrientation(availableCameras[next]);return}
+    }
+    // Fallback for devices not exposing their device IDs.
+    const front=document.getElementById('reader').classList.contains('front-camera');
+    if(await tryCamera({facingMode:front?'environment':'user'},'الكاميرا البديلة'))return;
+    setStatus('تعذر تبديل الكاميرا، اضغط تشغيل للمحاولة مجددًا','error');
+    setScanDebug(cameraErrors.join(' | '));
+  }finally{
+    cameraSwitching=false;
+    document.getElementById('startBtn').disabled=cameraRunning;
+    document.getElementById('stopBtn').disabled=!cameraRunning;
+    document.getElementById('switchBtn').disabled=!cameraRunning;
+  }
 }
 async function stopScanner(){
-  if(!scanner||cameraSwitching)return;
-  try{if(cameraRunning)await scanner.stop();scanner.clear()}catch(e){}
-  scanner=null;cameraRunning=false;
+  if(cameraSwitching)return;
+  await releaseScanner();
   document.getElementById('reader').classList.remove('front-camera');
   document.getElementById('startBtn').disabled=false;
   document.getElementById('stopBtn').disabled=true;
