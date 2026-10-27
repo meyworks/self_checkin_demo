@@ -25,6 +25,32 @@
     .status{font-weight:800;font-size:23px;margin:14px auto;min-height:35px}.ok{color:#167c4c}.warning{color:#b77918}.error{color:#bd3040}.processing{color:#3759af}
     .stats{font-size:17px;color:#616778;line-height:2}.demoqr{display:flex;justify-content:center;margin:14px 0}.qr-modal{position:fixed;inset:0;background:#141824c9;display:flex;align-items:center;justify-content:center;padding:20px;z-index:5}.qr-modal[hidden]{display:none}.qr-card{background:#fff;border-radius:18px;padding:26px;max-width:360px;width:100%;text-align:center}.qr-card h2{margin:0 0 10px}.qr-card #qrTarget{display:flex;justify-content:center;margin:20px auto}.qr-card small{display:block;word-break:break-word;margin-bottom:14px}
     @media(max-width:790px){body{padding:8px}.shell{border-width:2px}main{grid-template-columns:1fr;padding:20px;gap:25px}.welcome{margin-top:5px}.photo,.avatar{height:210px;width:180px}.status{font-size:20px}}
+
+    /* V4: permanent side-by-side scanner and member card, including Android phones */
+    body{padding:10px}
+    .shell{max-width:1180px}
+    header{padding:12px 10px}
+    header h1{font-size:clamp(23px,4vw,38px);margin:0}
+    header p{font-size:12px}
+    main{display:grid;grid-template-columns:minmax(0,1.12fr) minmax(0,.88fr);gap:14px;padding:15px;align-items:start;direction:ltr}
+    main section{min-width:0;direction:rtl}
+    h2{font-size:clamp(14px,2.1vw,22px);margin:0 0 10px}
+    #reader{width:100%;max-width:100%;min-height:160px;background:#111827;border:2px solid #ede1e6;border-radius:12px}
+    #reader video{width:100%!important;object-fit:cover}
+    .welcome{font-size:clamp(15px,2.8vw,28px);min-height:2em;margin:8px 0;overflow-wrap:anywhere}
+    .photo,.avatar{width:min(100%,230px);height:clamp(135px,25vw,270px);margin:8px auto;object-fit:cover}
+    .status{font-size:clamp(14px,2vw,22px);margin:8px 0}
+    .stats{font-size:clamp(12px,1.5vw,16px)}
+    .hint{font-size:12px}
+    .buttons{gap:6px;margin:9px 0}
+    button{padding:10px 11px;font-size:clamp(12px,1.5vw,15px)}
+    .demo{padding:10px;margin-top:9px}
+    .inputrow input{width:100%;max-width:100%;font-size:14px}
+    .inputrow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px}
+    #imageHint{overflow-wrap:anywhere}
+    #scanDebug{overflow-wrap:anywhere}
+    @media(max-width:790px){body{padding:3px}.shell{border-width:2px;border-radius:12px}main{grid-template-columns:minmax(0,1.12fr) minmax(0,.88fr);gap:7px;padding:7px}header{padding:9px 3px}header h1{font-size:25px}h2{font-size:14px}#reader{min-height:110px}.photo,.avatar{width:100%;height:clamp(150px,40vw,240px);font-size:56px}.welcome{font-size:16px}.status{font-size:14px}.stats{font-size:12px}.hint{font-size:10px;line-height:1.5}.buttons{gap:4px}button{padding:8px 5px;font-size:11px}.demo{padding:6px;font-size:12px}.inputrow{grid-template-columns:1fr}.inputrow input{padding:7px;font-size:12px}#scanDebug{font-size:10px}}
+    @media(max-width:370px){main{grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr);gap:5px;padding:5px}.photo,.avatar{height:140px}.welcome{font-size:14px}}
   </style>
 </head>
 <body>
@@ -73,18 +99,42 @@ function onQrDecoded(raw){
     setStatus('تم مسح QR لكن البيانات غير متوافقة. أنشئ QR من الزر الموجود بالصفحة.','warning');
     return;
   }
+  scanTone();
   setScanDebug('تمت قراءة QR بنجاح: '+mobile);
   document.getElementById('mobile').value=mobile;
   requestCheckin(mobile);
 }
 function setStatus(message,kind){let e=document.getElementById('status');e.textContent=message;e.className='status '+(kind||'')}
+let audioContext=null;
+function unlockAudio(){try{const C=window.AudioContext||window.webkitAudioContext;if(!C)return;if(!audioContext)audioContext=new C();if(audioContext.state==='suspended')audioContext.resume().catch(()=>{});}catch(e){}}
+function scanTone(){
+  try{unlockAudio();if(audioContext){const now=audioContext.currentTime;
+    const osc=audioContext.createOscillator(),gain=audioContext.createGain();
+    osc.type='sine';osc.frequency.setValueAtTime(900,now);osc.frequency.exponentialRampToValueAtTime(1150,now+.085);
+    gain.gain.setValueAtTime(.0001,now);gain.gain.exponentialRampToValueAtTime(.16,now+.012);gain.gain.exponentialRampToValueAtTime(.0001,now+.13);
+    osc.connect(gain);gain.connect(audioContext.destination);osc.start(now);osc.stop(now+.15);
+  }}catch(e){}try{if(navigator.vibrate)navigator.vibrate(60)}catch(e){}
+}
+function imageCandidates(raw){
+ const value=String(raw||'').trim();if(!value||/^#(?:NAME|REF|ERROR)!/i.test(value))return [];
+ if(/^https:\/\//i.test(value)){
+  const m=value.match(/\/d\/([A-Za-z0-9_-]+)/)||value.match(/[?&]id=([A-Za-z0-9_-]+)/);
+  if(m){return ['https://lh3.googleusercontent.com/d/'+m[1]+'=s800','https://drive.google.com/thumbnail?id='+m[1]+'&sz=w800',value]}
+  return [value];
+ }
+ // AppSheet-style relative path: \people\Name.jpeg or people/Name.jpeg
+ const normalized=value.replace(/\\/g,'/').replace(/^\/+/, '');
+ if(normalized.includes('..')||normalized.includes(':'))return [];
+ return [new URL(normalized.split('/').map(encodeURIComponent).join('/'),window.location.href).href];
+}
 function setImage(url){
-  const img=document.getElementById('photo'),avatar=document.getElementById('avatar'),hint=document.getElementById('imageHint');
-  img.onload=()=>{img.style.display='block';avatar.style.display='none';hint.textContent=''};
-  img.onerror=()=>{img.style.display='none';avatar.style.display='flex';hint.textContent='تعذر تحميل صورة العضو. تأكد أن رابط الصورة مباشر وأن الصورة متاحة للعرض من المتصفح.'};
-  img.removeAttribute('src');img.style.display='none';avatar.style.display='flex';hint.textContent='';
-  if(url){img.referrerPolicy='no-referrer';img.src=url;}
-  else {hint.textContent='لا توجد صورة متاحة لهذا العضو في عمود Image.';}
+ const img=document.getElementById('photo'),avatar=document.getElementById('avatar'),hint=document.getElementById('imageHint');
+ let candidates=imageCandidates(url),index=0;
+ img.onload=()=>{img.style.display='block';avatar.style.display='none';hint.textContent=''};
+ img.onerror=()=>{if(index<candidates.length){img.src=candidates[index++];return;}img.removeAttribute('src');img.style.display='none';avatar.style.display='flex';hint.textContent='الصورة غير متاحة. إذا كان Image مسار people/، ارفع ملف الصورة نفسه إلى مجلد people على GitHub.'};
+ img.removeAttribute('src');img.style.display='none';avatar.style.display='flex';hint.textContent='';
+ if(candidates.length){img.referrerPolicy='no-referrer';img.src=candidates[index++];}
+ else hint.textContent='لا توجد صورة متاحة لهذا العضو في عمود Image.';
 }
 function requestCheckin(value){
   const endpoint=(window.EDAD_CONFIG&&window.EDAD_CONFIG.appsScriptUrl||'').trim();
@@ -119,7 +169,7 @@ function requestCheckin(value){
   tag.src=url.toString();document.head.appendChild(tag);
 }
 function submitMobile(value){const mobile=parseQrMobile(value);if(!mobile){setStatus('أدخل رقم موبايل صحيحًا مكوّنًا من 11 رقمًا','warning');return}requestCheckin(mobile)}
-function checkinManually(){submitMobile(document.getElementById('mobile').value.trim())}
+function checkinManually(){unlockAudio();submitMobile(document.getElementById('mobile').value.trim())}
 function preferredRearIndex(cameras){
   const rear=cameras.findIndex(c=>/back|rear|environment|خلف/i.test(c.label||''));
   if(rear>=0)return rear;
@@ -137,7 +187,12 @@ async function startSelectedCamera(){
   const camera=availableCameras[currentCameraIndex];
   if(!camera)throw new Error('الكاميرا المختارة غير متاحة');
   if(!scanner)scanner=new Html5Qrcode('reader',{verbose:false,formatsToSupport:[Html5QrcodeSupportedFormats.QR_CODE]});
-  await scanner.start(camera.id,{fps:12,aspectRatio:1.333333},onQrDecoded,()=>{});
+  await scanner.start(camera.id,{
+    fps:22,
+    qrbox:(viewW,viewH)=>{const size=Math.max(90,Math.floor(Math.min(viewW,viewH)*.83));return {width:size,height:size};},
+    disableFlip:false,
+    videoConstraints:{deviceId:{exact:camera.id},width:{ideal:1280},height:{ideal:720}}
+  },onQrDecoded,()=>{});
   cameraRunning=true;
   updatePreviewOrientation(camera);
   document.getElementById('startBtn').disabled=true;
@@ -147,6 +202,7 @@ async function startSelectedCamera(){
   if(!busy)setStatus('وجّه الكاميرا نحو QR','processing');
 }
 async function startScanner(){
+  unlockAudio();
   if(cameraRunning||cameraSwitching)return;
   if(typeof Html5Qrcode==='undefined'){setStatus('تعذر تحميل مكتبة QR؛ تحقق من الإنترنت','error');return}
   document.getElementById('startBtn').disabled=true;
