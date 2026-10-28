@@ -61,7 +61,7 @@
     <h2>امسح رمز QR لتسجيل حضورك</h2>
     <div id="reader"></div>
     <div class="buttons"><button type="button" id="startBtn" onclick="startScanner()">تشغيل الكاميرا</button><button type="button" class="secondary" id="switchBtn" onclick="switchCamera()" disabled>🔄 تبديل الكاميرا</button><button type="button" class="secondary" id="stopBtn" onclick="stopScanner()" disabled>إيقاف الكاميرا</button></div>
-    <div class="hint">لاستخدام الكاميرا، افتح التطبيق عبر HTTPS واسمح بالوصول إليها.</div><div id="scanDebug" class="hint" role="status" aria-live="polite">في انتظار قراءة QR...</div>
+    <div class="hint">لاستخدام الكاميرا، افتح التطبيق عبر HTTPS واسمح بالوصول إليها.</div><div id="scanDebug" class="hint" role="status" aria-live="polite">في انتظار تشغيل الكاميرا...</div>
     <div class="demo"><strong>تجربة عملية بدون كاميرا</strong><div class="inputrow"><input id="mobile" inputmode="tel" placeholder="01xxxxxxxxx" aria-label="رقم الموبايل"><button onclick="checkinManually()">تسجيل الحضور</button></div>
       <div class="buttons"><button class="secondary" onclick="showQr()">إنشاء QR لرقم الموبايل</button></div><div class="hint">أضف رقم العضو إلى ورقة Members أولًا، ثم جرّب المسح أو الإدخال اليدوي.</div></div>
   </section>
@@ -170,117 +170,116 @@ function requestCheckin(value){
 }
 function submitMobile(value){const mobile=parseQrMobile(value);if(!mobile){setStatus('أدخل رقم موبايل صحيحًا مكوّنًا من 11 رقمًا','warning');return}requestCheckin(mobile)}
 function checkinManually(){unlockAudio();submitMobile(document.getElementById('mobile').value.trim())}
-function preferredRearIndex(cameras){
-  const rear=cameras.findIndex(c=>/back|rear|environment|خلف/i.test(c.label||''));
-  if(rear>=0)return rear;
-  const front=cameras.findIndex(c=>/front|user|face|أمام/i.test(c.label||''));
-  return cameras.length>1&&front===0?1:0;
+// One active camera stream at a time. Prefer Android's native QR detector.
+let nativeStream=null, nativeVideo=null, nativeDetector=null, nativeScanLoop=0;
+let activeFacing='environment', cameraDeviceId='', cameraDevices=[], scannerGeneration=0;
+let scanningMode='';
+function updateControls(){
+ document.getElementById('startBtn').disabled=cameraSwitching||cameraRunning;
+ document.getElementById('stopBtn').disabled=cameraSwitching||!cameraRunning;
+ document.getElementById('switchBtn').disabled=cameraSwitching||!cameraRunning;
 }
-function updatePreviewOrientation(camera){
-  const label=String(camera.label||'');
-  const isFront=/front|user|face|أمام/i.test(label)||
-    (availableCameras.length===2&&!/back|rear|environment|خلف/i.test(label)&&
-      currentCameraIndex!==preferredRearIndex(availableCameras));
-  document.getElementById('reader').classList.toggle('front-camera',isFront);
-}
-// Camera starts with environment-facing mode first (more reliable on Android).
-// Avoid combining a camera ID and exact videoConstraints: Android browsers may reject it.
-function newQrScanner(){
-  return new Html5Qrcode('reader',{verbose:false,formatsToSupport:[Html5QrcodeSupportedFormats.QR_CODE]});
-}
-function scanConfig(){
-  return {fps:12, qrbox:(w,h)=>{
-    const side=Math.max(80,Math.floor(Math.min(w,h)*.86));
-    return {width:side,height:side};
-  },disableFlip:false};
+function updatePreviewOrientation(){
+ document.getElementById('reader').classList.toggle('front-camera',activeFacing==='user');
 }
 async function releaseScanner(){
-  if(!scanner)return;
-  try{if(cameraRunning || scanner.getState()===2)await scanner.stop()}catch(_){}
-  try{scanner.clear()}catch(_){}
-  scanner=null;cameraRunning=false;
+ ++scannerGeneration;
+ if(nativeScanLoop){cancelAnimationFrame(nativeScanLoop);nativeScanLoop=0;}
+ if(nativeVideo){try{nativeVideo.pause()}catch(_){} nativeVideo.srcObject=null;nativeVideo.remove();nativeVideo=null;}
+ if(nativeStream){nativeStream.getTracks().forEach(t=>t.stop());nativeStream=null;}
+ if(scanner){const old=scanner;scanner=null;try{await old.stop()}catch(_){}try{old.clear()}catch(_){}}
+ cameraRunning=false; scanningMode='';
+ document.getElementById('reader').classList.remove('front-camera');
+ // Android sometimes needs a short gap to relinquish the previous camera.
+ await new Promise(resolve=>setTimeout(resolve,350));
 }
-async function tryCamera(source, label){
-  await releaseScanner();
-  scanner=newQrScanner();
-  setScanDebug('جارٍ تجربة '+label+'...');
-  try{
-    await scanner.start(source,scanConfig(),onQrDecoded,()=>{});
-    cameraRunning=true;
-    document.getElementById('reader').classList.toggle('front-camera',typeof source==='object'&&source.facingMode==='user');
-    document.getElementById('startBtn').disabled=true;
-    document.getElementById('stopBtn').disabled=false;
-    document.getElementById('switchBtn').disabled=availableCameras.length<2;
-    setScanDebug('الكاميرا تعمل — وجّه QR نحو العدسة');
-    if(!busy)setStatus('وجّه الكاميرا نحو QR','processing');
-    return true;
-  }catch(e){
-    cameraErrors.push(label+': '+String(e&&e.message||e));
-    await releaseScanner();
-    return false;
+async function getDevices(){
+ try{cameraDevices=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput');}
+ catch(_){cameraDevices=[];}
+}
+function getSourceForFacing(facing){
+ return {audio:false,video:{facingMode:{ideal:facing},width:{ideal:1280},height:{ideal:720}}};
+}
+async function startNativeCamera(facing, deviceId){
+ if(!('BarcodeDetector' in window))throw new Error('Native QR reader not supported');
+ const supported=await BarcodeDetector.getSupportedFormats();
+ if(!supported.includes('qr_code'))throw new Error('Native QR decoding not supported');
+ nativeDetector=new BarcodeDetector({formats:['qr_code']});
+ const videoOpts=deviceId?{deviceId:{exact:deviceId}}:getSourceForFacing(facing).video;
+ nativeStream=await navigator.mediaDevices.getUserMedia({audio:false,video:videoOpts});
+ nativeVideo=document.createElement('video');nativeVideo.autoplay=true;nativeVideo.muted=true;nativeVideo.playsInline=true;
+ nativeVideo.setAttribute('playsinline','');nativeVideo.setAttribute('muted','');
+ nativeVideo.style.cssText='width:100%;height:auto;min-height:170px;max-height:440px;object-fit:cover;display:block;background:#111827';
+ document.getElementById('reader').replaceChildren(nativeVideo);
+ nativeVideo.srcObject=nativeStream;
+ await nativeVideo.play();
+ await getDevices();
+ const current=nativeStream.getVideoTracks()[0];
+ cameraDeviceId=current?.getSettings?.().deviceId||deviceId||'';
+ const label=current?.label||'';
+ activeFacing=/front|user|face|أمام/i.test(label)?'user':(/back|rear|environment|خلف/i.test(label)?'environment':facing);
+ updatePreviewOrientation();
+ cameraRunning=true;scanningMode='native';updateControls();
+ setScanDebug('الكاميرا تعمل — قارئ QR نشط. وجّه الكود أمام العدسة.');
+ setStatus('جاهز للمسح','processing');
+ const generation=scannerGeneration;let lastFrame=0;
+ async function tick(time){
+  if(generation!==scannerGeneration||!cameraRunning||scanningMode!=='native')return;
+  if(time-lastFrame>90 && nativeVideo && nativeVideo.readyState>=2){
+    lastFrame=time;
+    try{const codes=await nativeDetector.detect(nativeVideo);
+      if(generation!==scannerGeneration)return;
+      if(codes.length){onQrDecoded(codes[0].rawValue||'');}
+    }catch(err){if(generation===scannerGeneration)setScanDebug('تعذر تحليل إطار QR: '+String(err.message||err));}
   }
+  if(generation===scannerGeneration)nativeScanLoop=requestAnimationFrame(tick);
+ }
+ nativeScanLoop=requestAnimationFrame(tick);
 }
-let cameraErrors=[];
+async function startLibraryCamera(facing,deviceId){
+ if(typeof Html5Qrcode==='undefined')throw new Error('لم يتم تحميل مكتبة QR');
+ scanner=new Html5Qrcode('reader',{verbose:false,formatsToSupport:[Html5QrcodeSupportedFormats.QR_CODE],useBarCodeDetectorIfSupported:false});
+ const source=deviceId||{facingMode:facing};
+ await scanner.start(source,{fps:15,qrbox:undefined,disableFlip:false,aspectRatio:undefined},onQrDecoded,()=>{});
+ cameraRunning=true;scanningMode='library';activeFacing=facing;cameraDeviceId=deviceId||'';
+ updatePreviewOrientation();await getDevices();updateControls();
+ setStatus('جاهز للمسح','processing');setScanDebug('الكاميرا تعمل — قارئ QR نشط. وجّه الكود أمام العدسة.');
+}
+async function openCamera(facing,deviceId=''){
+ await releaseScanner();
+ let errors=[];
+ try{await startNativeCamera(facing,deviceId);return true}catch(e){errors.push('Native: '+(e.message||e));await releaseScanner();}
+ try{await startLibraryCamera(facing,deviceId);return true}catch(e){errors.push('Library: '+(e.message||e));await releaseScanner();}
+ setScanDebug('سبب الفشل: '+errors.join(' | '));return false;
+}
 async function startScanner(){
-  unlockAudio();
-  if(cameraRunning||cameraSwitching)return;
-  if(!window.isSecureContext){setStatus('الكاميرا تحتاج رابط HTTPS آمنًا','error');return}
-  if(typeof Html5Qrcode==='undefined'){setStatus('تعذر تحميل مكتبة QR؛ تحقق من الإنترنت','error');return}
-  cameraSwitching=true;
-  document.getElementById('startBtn').disabled=true;
-  cameraErrors=[];
-  try{
-    // Try generic facingMode first; avoids Android deviceId exact failures.
-    if(await tryCamera({facingMode:'environment'},'الكاميرا الخلفية'))return;
-    try{availableCameras=await Html5Qrcode.getCameras()}catch(e){cameraErrors.push('قائمة الكاميرات: '+String(e&&e.message||e));availableCameras=[]}
-    const order=availableCameras.map((_,i)=>i);
-    const rear=preferredRearIndex(availableCameras);
-    if(order.includes(rear)){order.splice(order.indexOf(rear),1);order.unshift(rear)}
-    for(const i of order){
-      currentCameraIndex=i;
-      if(await tryCamera(availableCameras[i].id,'الكاميرا '+(i+1))){updatePreviewOrientation(availableCameras[i]);return}
-    }
-    if(await tryCamera({facingMode:'user'},'الكاميرا الأمامية'))return;
-    setStatus('تعذر فتح الكاميرا. تفاصيل الخطأ أسفلها.','error');
-    setScanDebug('سبب الفشل: '+cameraErrors.join(' | '));
-  }finally{
-    cameraSwitching=false;
-    document.getElementById('startBtn').disabled=cameraRunning;
-    document.getElementById('stopBtn').disabled=!cameraRunning;
-  }
+ unlockAudio();if(cameraSwitching||cameraRunning)return;
+ if(!window.isSecureContext){setStatus('افتح الصفحة عبر HTTPS لتشغيل الكاميرا','error');return;}
+ cameraSwitching=true;updateControls();
+ try{
+   // Request the rear camera initially; native QR decoding on Chrome Android where available.
+   if(!await openCamera('environment'))setStatus('تعذر تشغيل الماسح. راجع السبب أسفل الكاميرا.','error');
+ }finally{cameraSwitching=false;updateControls();}
 }
 async function switchCamera(){
-  if(!cameraRunning||cameraSwitching)return;
-  cameraSwitching=true;
-  cameraErrors=[];
-  try{
-    if(!availableCameras.length){
-      try{availableCameras=await Html5Qrcode.getCameras()}catch(_){}
-    }
-    if(availableCameras.length>1){
-      let next=(currentCameraIndex+1)%availableCameras.length;
-      if(await tryCamera(availableCameras[next].id,'الكاميرا '+(next+1))){currentCameraIndex=next;updatePreviewOrientation(availableCameras[next]);return}
-    }
-    // Fallback for devices not exposing their device IDs.
-    const front=document.getElementById('reader').classList.contains('front-camera');
-    if(await tryCamera({facingMode:front?'environment':'user'},'الكاميرا البديلة'))return;
-    setStatus('تعذر تبديل الكاميرا، اضغط تشغيل للمحاولة مجددًا','error');
-    setScanDebug(cameraErrors.join(' | '));
-  }finally{
-    cameraSwitching=false;
-    document.getElementById('startBtn').disabled=cameraRunning;
-    document.getElementById('stopBtn').disabled=!cameraRunning;
-    document.getElementById('switchBtn').disabled=!cameraRunning;
-  }
+ if(cameraSwitching||!cameraRunning)return;
+ cameraSwitching=true;updateControls();
+ const oldFacing=activeFacing;
+ const nextFacing=oldFacing==='environment'?'user':'environment';
+ const oldId=cameraDeviceId;
+ await getDevices();
+ const alternatives=cameraDevices.filter(d=>d.deviceId&&d.deviceId!==oldId);
+ let target=alternatives.find(d=>nextFacing==='user'?/front|user|face/i.test(d.label):/back|rear|environment/i.test(d.label));
+ try{
+   let worked=await openCamera(nextFacing,target?.deviceId||'');
+   if(!worked && alternatives.length)worked=await openCamera(nextFacing,alternatives[0].deviceId);
+   if(!worked){setStatus('تعذر تبديل الكاميرا. اضغط تشغيل لإعادة المحاولة.','error');}
+ }finally{cameraSwitching=false;updateControls();}
 }
 async function stopScanner(){
-  if(cameraSwitching)return;
-  await releaseScanner();
-  document.getElementById('reader').classList.remove('front-camera');
-  document.getElementById('startBtn').disabled=false;
-  document.getElementById('stopBtn').disabled=true;
-  document.getElementById('switchBtn').disabled=true;
-  setScanDebug('الكاميرا متوقفة');
+ if(cameraSwitching)return;cameraSwitching=true;updateControls();
+ try{await releaseScanner();setScanDebug('الكاميرا متوقفة');setStatus('تم إيقاف الكاميرا','processing');}
+ finally{cameraSwitching=false;updateControls();}
 }
 function showQr(){let value=parseQrMobile(document.getElementById('mobile').value);if(!value){setStatus('أدخل رقم موبايل مصري صحيح أولاً','error');return}if(typeof QRCode==='undefined'){setStatus('تعذر تحميل مكتبة QR','error');return}document.getElementById('qrTarget').innerHTML='';new QRCode(document.getElementById('qrTarget'),{text:value,width:210,height:210});document.getElementById('qrMobile').textContent=value;document.getElementById('qrModal').hidden=false}
 </script>
